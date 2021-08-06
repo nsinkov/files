@@ -1,0 +1,29 @@
+#!/bin/bash
+
+cmd='{
+ "groups": [
+   '
+blah=false
+for i in {1..500}; do
+  gid=$(cat /proc/sys/kernel/random/uuid)
+  $blah && cmd=${cmd}','
+  $blah || blah=true
+  cmd=${cmd}'{
+    "straggler-handling": {
+      "type": "quantile-deviation",
+      "parameters": {
+        "multiplier": 2.0,
+        "quantile": 0.5
+      }
+    },
+    "uuid": "'$gid'"
+  }'
+done
+cmd=${cmd}'],
+  "jobs": []
+}'
+
+time curl -s -u: --negotiate -XPOST 'http://127.0.0.1:12321/jobs' -H 'Content-Type: application/json' -d "$cmd"
+
+#echo $cmd | jq
+
