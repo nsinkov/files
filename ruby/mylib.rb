@@ -105,6 +105,7 @@ def include_case_transform
 	end
 end
 
+$_rnd_escape_sprintf = '6zriRijNQ5vdnYjxVb9yvr0742Okj4U0ZM0zK8qQ'
 class String
     def camel
         include_case_transform
@@ -115,6 +116,10 @@ class String
         CaseTransform.camel self
     end
     def snake
+        include_case_transform
+        CaseTransform.underscore self
+    end
+    def underscore
         include_case_transform
         CaseTransform.underscore self
     end
@@ -187,7 +192,11 @@ class String
 		self.json(object_class: OpenStruct)
 	end
 	def read
-		IO.read(self)
+		if self == "-"
+			$<.read
+		else
+			IO.read(self)
+		end
 	end
 	def binread
 		IO.binread(self)
@@ -208,6 +217,7 @@ class String
 	def writeto(fileName)
 		IO.write(fileName, self)
 	end
+		alias_method :write_to, :writeto
 	def write(text)
 		IO.write(self, text)
 	end
@@ -296,21 +306,18 @@ class String
     
     alias_method :old_interpolate, '%'.to_sym
     def % *args, &block
-	  rnd_escape_sprintf = '6zriRijNQ5vdnYjxVb9yvr0742Okj4U0ZM0zK8qQ'
       self_clean_escapes=self
-	  .gsub(/%{%([^}]+)}/, rnd_escape_sprintf + '\1') # this allows the normal Kernel.sprintf formatting e.g. puts "%{%02X}" % 5
+	  .gsub(/%{%([^}]+)}/, $_rnd_escape_sprintf + '\1') # this allows the normal Kernel.sprintf formatting e.g. puts "%{%02X}" % 5
 	  .gsub(/%(?!{)/,'%%')                            # automatically escape any instance of % in the string, except if followed by {
 	  .gsub('%{"', '%%{')                             # this allows escaping %{
 	  .gsub('%{}','%s')
-	  .gsub(rnd_escape_sprintf,'%')
+	  .gsub($_rnd_escape_sprintf,'%')
 	        
       if args.length == 1
         if args[0].is_a?(OpenStruct)
           return self_clean_escapes.old_interpolate args[0].to_h
         elsif args[0].is_a?(Hash)
           return self_clean_escapes.old_interpolate args[0]
-        # elsif args[0].is_a?(MyOpts)
-        #   return self_clean_escapes.old_interpolate args[0].o_.os.to_h
         elsif args[0].is_a?(Array)
           return self.old_interpolate args[0]         # if passing in array, then we can't have named, %{}, syntax
         else
@@ -421,6 +428,7 @@ end
 # $x=6
 # 5.then{|x| x+1}.then{|x| x+1}.then{|x| x+1}.then '$x='
 # p $x
+# TODO: regex magic variables will not be properly set if we don't evaluate map in the block's binding
 def _my_map old_map, *args, &block
     if args.size > 0 and block.nil?
         if args[0].is_a? String
@@ -458,7 +466,6 @@ module Enumerable
 		self.each_with_object({}, &)
 	end
 	def eachs(&)
-		include_set
 		self.each_with_object(Set.new, &)
 	end
 	def eacha(&)
@@ -497,7 +504,6 @@ module Enumerable
 		runtasks! self
 	end
 	def to_set
-		include_set
 		Set.new self
 	end
 	def kmap key
@@ -546,14 +552,10 @@ class Array
   
 end
 
-def include_set
-	if !$_set_called
-		require 'set'
-		$_set_called = true
-		Set.send(:alias_method, :contains?, :include?)
-		Set.send(:alias_method, :addAll, :merge)
-		Set.send(:alias_method, :add_all, :merge)
-	end
+class Set
+	alias_method :contains?, :include?
+	alias_method :addAll, :merge
+	alias_method :add_all, :merge
 end
 
 class Hash
@@ -607,7 +609,6 @@ class Hash
 		self[key]=value
 	end
 	def to_set
-		include_set
 		Set.new self.keys
 	end
 	def method_missing(meth, *args, &block)
@@ -784,47 +785,61 @@ end
 #
 # short options:
 class MyOpts
+	@@shortcuts = {
+		r: 'required:true',
+		m: 'multi:true',
+		i: 'type: :int',
+		f: 'type: :float',
+		#a: array - see below
+	}
+	@@shortcut_keys = (@@shortcuts.keys + [:a]).to_set
 	def initialize
 		specs = {}.of_maps
 		@opts = Optimist::options do
-			optsrx = /^(?<left_side>.*(?:^|\W))opts\.(?<usage>\w+\??)(?<assignment>\s*=\s*)?(?:.*#\s*(?<desc>(?:[^,]|,,)*)(?<params>,.+)?)?/
-			matches = source_code_lines.map{|sourceCodeLine|
-				optsrx.match sourceCodeLine
-			}
-			for match in matches
-				next if match.nil?
-				next if match['assignment']
-				next if match['left_side'].to_s[0] == '#'
-				usage = match['usage']
-				flag = usage[-1]=="?"
-				name = flag ? usage[..-2] : usage
-				spec = specs[name]
-				spec.flag? flag
-				spec.desc? match['desc'].to_s.gsub ',,',','
-				params = match['params']
-				if params
-					params = params[1..].split ','
-					shortcuts = {
-						r: 'required:true',
-						m: 'multi:true',
-						i: 'type: :int',
-						f: 'type: :float',
-					 #a: array - see below
-					}
-					is_array, params = params.partition{_1 == 'a'}
-					spec.array = is_array.empty?.!
-					unless params.empty?
-						params = params.map do |param|
-							param.strip!
-							shortcuts.get param.to_sym, param
-						end
-						spec.params = (spec.params? []) + params
+			educate_on_error
+
+			optsrx = %r!(?:^|\W)opts\.(?<usage>\w+\??)(?<assignment>\s*=\s*)?(?<params>/(?:[^/]|//)*/)?(?<null_coalesce>\._\?)?!
+			source_code_lines.each{|sourceCodeLine|
+				sourceCodeLine.scan(optsrx){
+					match = $~
+					next if match['assignment']
+					usage = match['usage']
+					flag = usage[-1]=="?"
+					name = flag ? usage[..-2] : usage
+					spec = specs[name]
+					spec.params = spec.params? []
+					spec.flag? flag
+					if match['null_coalesce']
+						spec.params << "required:false"
 					end
-				end
-			end
+					params = match['params']
+					if params
+						params = params[1..-2].gsub ',,', $_rnd_escape_sprintf
+						params = params.split ','
+						is_array_params, params = params.partition{_1 == 'a'}
+						spec.array = is_array_params.empty?.!
+						params.eachi do |param, i|
+							if param.starts_with? "="
+								spec.params << "required:false"
+								spec.params << "default: #{param[1..]}"
+							elsif param.length == 1
+								spec.params << @@shortcuts.get(param.to_sym, param)
+							else
+								if i == 0
+									spec.desc? param.gsub($_rnd_escape_sprintf, ',')
+								else
+									spec.params << param
+								end
+							end
+						end
+					end
+				}
+			}
 
 			for name, spec in specs
 				params = spec.params? []
+				optional = params.any?{_1[/\s*required:\s*false/]}
+				params << 'required:true' unless optional
 				required = params.any?{_1[/\s*required:\s*true/]}
 				multi = params.any?{_1[/\s*multi:\s*true/]}
 				type = nil
@@ -840,7 +855,7 @@ class MyOpts
 					type = spec.flag ? ":bool" : ":string"
 					params << "type: #{type}#{spec.array? ? "s" : ""}"
 				end
-				eval "opt :#{name}, '#{spec.desc}#{multi ? " (multi)" : ""}#{required ? " (required)" : ""}', #{params.joinc}"
+				eval "opt :#{name}, '#{spec.desc? ''}#{multi ? " (multi)" : ""}#{required ? " (required)" : ""}', #{params.reject(&:empty?).joinc}"
 			end
 		end
 	end
@@ -1264,7 +1279,8 @@ end
 class String
     def time
 			parse_time self
-    end
+		end
+		alias_method :date, :time
 end
 
 class Numeric
